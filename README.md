@@ -47,7 +47,7 @@ always runs first and hands its output to `reviewer_agent`.
 |---|---|
 | Multi-agent system (ADK) | `SequentialAgent` chaining `planner_agent` → `reviewer_agent` in `agent.py` |
 | MCP Server | `mcp_server.py` — a standalone MCP server exposing `get_available_hours`, launched as a subprocess and called live via `McpToolset` |
-| Security features | `study_request_guardrail`, a `before_model_callback` that inspects every request *before* it reaches the model and blocks unsafe/unrealistic asks |
+| Security features | `study_request_guardrail`, a `before_agent_callback` on the pipeline that inspects the request once, before either agent runs, and — if unsafe/unrealistic — skips the entire pipeline (no model call, no tool call, from either agent) |
 
 ## Repo contents
 - `mcp_server.py` — MCP server with the `get_available_hours` tool (mock calendar data)
@@ -84,7 +84,7 @@ python main.py "Learn enough SQL for a job interview" 5
 
 ## Safety notes
 - No API keys are hardcoded anywhere in this repo.
-- The guardrail runs **before** any model call — unsafe requests never reach the LLM.
+- The guardrail runs **once, before the whole pipeline** — unsafe requests never reach either agent's model call or the MCP tool. (Verified live: an earlier per-agent version let a blocked request "leak" into the second agent; the fix moves the check to a single `before_agent_callback` on the pipeline itself.)
 - The MCP server only exposes one read-only tool (`get_available_hours`) — no write access, no ability to modify a real calendar.
 
 ## Possible extensions

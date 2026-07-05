@@ -20,11 +20,11 @@ before running.
 """
 
 import os
+import re
 import sys
 
 from google.adk.agents import LlmAgent, SequentialAgent
 from google.adk.agents.callback_context import CallbackContext
-from google.adk.models import LlmRequest, LlmResponse
 from google.adk.tools.mcp_tool import McpToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
 from mcp import StdioServerParameters
@@ -32,64 +32,68 @@ from google.genai import types as genai_types
 
 # ---------------------------------------------------------------------------
 # 1) SECURITY GUARDRAIL
-#    Runs before every call to the LLM. If the user's request is unsafe or
-#    unrealistic, we short-circuit and return a fixed response instead of
-#    letting the model (and the agent pipeline) proceed.
+#    IMPORTANT DESIGN NOTE: this is a `before_agent_callback` attached to the
+#    ROOT pipeline (the SequentialAgent), not to each individual sub-agent.
+#    It runs exactly ONCE, before planner_agent or reviewer_agent ever run.
+#    If it returns a Content object, ADK skips the ENTIRE pipeline and uses
+#    that Content as the final answer -- so an unsafe/unrealistic request
+#    never reaches ANY agent or ANY model call, and can't "leak through" to
+#    a downstream agent (which is exactly what happened in our first version
+#    of this guardrail, when it was attached per-agent instead).
 # ---------------------------------------------------------------------------
 MAX_REASONABLE_DAILY_HOURS = 16  # a human cannot productively study more than this
 
+UNSAFE_SIGNALS = [
+    "no sleep", "without sleep", "all nighter every night",
+    "24 hours a day", "24/7",
+]
+
+
+def _extract_user_text(callback_context: CallbackContext) -> str:
+    """Gets the raw text of the original user request for this invocation."""
+    invocation_ctx = callback_context._invocation_context
+    user_content = getattr(invocation_ctx, "user_content", None)
+    if not user_content or not user_content.parts:
+        return ""
+    for part in user_content.parts:
+        if getattr(part, "text", None):
+            return part.text
+    return ""
+
 
 def study_request_guardrail(
-    callback_context: CallbackContext, llm_request: LlmRequest
-) -> LlmResponse | None:
-    """Blocks requests that ask for unrealistic/unsafe study schedules."""
-    # Pull the latest user text out of the request contents
-    last_user_text = ""
-    for content in reversed(llm_request.contents or []):
-        if content.role == "user" and content.parts:
-            for part in content.parts:
-                if getattr(part, "text", None):
-                    last_user_text = part.text
-                    break
-            if last_user_text:
-                break
+    callback_context: CallbackContext,
+) -> genai_types.Content | None:
+    """Blocks the whole pipeline if the request is unsafe/unrealistic.
 
-    lowered = last_user_text.lower()
+    Returns a Content object to short-circuit (skip planner + reviewer
+    entirely), or None to let the pipeline run normally.
+    """
+    lowered = _extract_user_text(callback_context).lower()
 
-    # crude but effective checks for obviously unsafe/unrealistic asks
-    unsafe_signals = [
-        "no sleep", "without sleep", "all nighter every night",
-        "24 hours a day", "24/7",
-    ]
-    if any(s in lowered for s in unsafe_signals):
-        return LlmResponse(
-            content=genai_types.Content(
-                role="model",
-                parts=[genai_types.Part(text=(
-                    "I can't build a plan that skips sleep or runs 24/7 — "
-                    "that's not sustainable or safe. Tell me your goal and "
-                    "deadline and I'll build a realistic schedule instead."
-                ))],
-            )
+    if any(s in lowered for s in UNSAFE_SIGNALS):
+        return genai_types.Content(
+            role="model",
+            parts=[genai_types.Part(text=(
+                "I can't build a plan that skips sleep or runs 24/7 — "
+                "that's not sustainable or safe. Tell me your goal and "
+                "deadline and I'll build a realistic schedule instead."
+            ))],
         )
 
-    # look for an explicit "N hours" pattern and cap it
-    import re
     for match in re.finditer(r"(\d{1,3})\s*hours?", lowered):
         hours = int(match.group(1))
         if hours > MAX_REASONABLE_DAILY_HOURS:
-            return LlmResponse(
-                content=genai_types.Content(
-                    role="model",
-                    parts=[genai_types.Part(text=(
-                        f"{hours} hours in a day isn't realistic (max ~"
-                        f"{MAX_REASONABLE_DAILY_HOURS} productive study hours). "
-                        "Please give me a more realistic daily limit."
-                    ))],
-                )
+            return genai_types.Content(
+                role="model",
+                parts=[genai_types.Part(text=(
+                    f"{hours} hours in a day isn't realistic (max ~"
+                    f"{MAX_REASONABLE_DAILY_HOURS} productive study hours). "
+                    "Please give me a more realistic daily limit."
+                ))],
             )
 
-    # request looks fine -> return None so the real model call proceeds
+    # request looks fine -> return None so the pipeline proceeds
     return None
 
 
@@ -124,7 +128,6 @@ planner_agent = LlmAgent(
         "worry yet about whether the hours are realistic — a reviewer will "
         "check that next. Output the draft plan clearly labelled by day."
     ),
-    before_model_callback=study_request_guardrail,
 )
 
 reviewer_agent = LlmAgent(
@@ -139,13 +142,15 @@ reviewer_agent = LlmAgent(
         "plan as a clear table: Date | Weekday | Available Hours | Planned Hours | Topic."
     ),
     tools=[calendar_toolset],
-    before_model_callback=study_request_guardrail,
 )
 
 # root_agent: the entry point ADK looks for when running `adk run` / `adk web`
+# The guardrail is attached HERE (before_agent_callback), so it runs once,
+# before the pipeline starts, and can block both sub-agents at once.
 root_agent = SequentialAgent(
     name="study_planner_pipeline",
     sub_agents=[planner_agent, reviewer_agent],
+    before_agent_callback=study_request_guardrail,
     description=(
         "Multi-agent pipeline: planner_agent drafts a study schedule, then "
         "reviewer_agent checks it against real calendar availability (via "
